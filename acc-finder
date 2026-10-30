@@ -1,51 +1,204 @@
-# INPUT LIST
-LIST=$1
+#!/usr/bin/env bash
+# Resolve NCBI identifiers to SAMPLE_NAME, BioSample, SRA runs and GenBank assemblies.
+# Requires: bash >= 4, EDirect (esearch, efetch) and jq.
+#
+# Instead of querying NCBI once per identifier, all identifiers are collected and
+# sent as batched OR-queries (CHUNK terms per request). Results are then matched
+# back to each input locally. A list of N identifiers needs roughly
+# 5 * ceil(N / CHUNK) query rounds instead of ~4 * N.
+set -o pipefail
 
-# INPUT CHECK
-if [[ "$LIST" == '' ]]; then echo "Please provide a file containing NCBI accessions (SAMN, GENBANK/REFSEQ, SRA/SRS) and/or sample names" && exit 0; fi
+usage() {
+    cat >&2 <<USAGE
+Usage: ${0##*/} <file>
 
-find_acc () {
-    # INPUT VALUE
-    local INPUT=$1
+  <file>  One identifier per line. Accepted:
+            BioSample   SAMN..., SAMEA..., SAMD...
+            Assembly    GCA_/GCF_ (version optional)
+            SRA         SRR/SRX/SRS (also ERR/DRR etc.)
+            anything else is matched against BioSample identifiers (e.g. sample name)
+          Blank lines and '#' comments are ignored.
 
-    # BIOSAMPLE ACCESSION (SAMN NUMBER)
-    if [[ "$INPUT" =~ ^"SAMN"[0-9]+ ]]
-    then
-        # SAMN provided
-        SAMN=$INPUT
-    elif [[ "$INPUT" =~ ^"GC"[AF]"_"[0-9]+"."[0-9] ]]
-    then
-        # SRA/SRS provided
-        SAMN=$(esearch -db assembly -query $INPUT | efetch -format docsum -mode json | jq '.result[.result.uids[0]].biosampleaccn' | tr -d '"')
-    elif [[ "$INPUT" =~ ^"SR"[RA][0-9]+ ]]
-    then
-        # GENBANK/REFSEQ provided
-        SAMN=$(esearch -db sra -query $INPUT | efetch -format docsum -mode json | jq '.result[.result.uids[0]].expxml' | sed 's/.*<Biosample>//g' | sed 's/<\/Biosample>.*//g')
-    else
-        # OTHER provided (e.g., SAMPLE_NAME)
-        SAMN=$(esearch -db biosample -query $INPUT | efetch -format docsum -mode json | jq '.result[.result.uids[0]].accession' | tr -d '"')
-    fi
-
-    # SAMPLE NAME
-    SAMPLE_NAME=$(esearch -db biosample -query $SAMN | efetch -format docsum -mode json | jq '.result[.result.uids[0]].identifiers' | tr -d ' "' | tr ';' '\n' | sed 's/.*://g' | sed -n 2p)
-
-    # SRA ACCESSION
-    SRA=$(esearch -db sra -query $SAMN | efetch -format docsum -mode json | jq '.result[.result.uids[0]].runs' | tr -d '" ' | tr '\\' '\n' | sed -n 2p)
-
-    # ASSEMBLY ACCESSION
-    GENBANK=$(esearch -db assembly -query $SAMN | efetch -format docsum -mode json | jq '.result[.result.uids[0]].synonym.genbank' | tr -d '"')
-
-    # RESULT
-    echo "$SAMPLE_NAME,$SAMN,$SRA,$GENBANK"
-
+Output: CSV on stdout, in input order. Multiple SRA runs / assemblies are ';'-separated.
+        Progress and warnings go to stderr.
+Env:    CHUNK=200         terms per NCBI query
+        NCBI_API_KEY=...  raises NCBI's rate limit (3 -> 10 req/s)
+USAGE
+    exit 1
 }
 
-# RESULT HEADER
-echo "SAMPLE_NAME,SAMN,SRA,GENBANK"
+die()  { echo "Error: $*" >&2; exit 1; }
+warn() { echo "Warning: $*" >&2; }
+log()  { echo "$*" >&2; }
 
-# LOOP OVER LIST
-for i in $(cat $LIST)
-do
-    find_acc $i
+# ---------- checks ----------
+[[ $# -eq 1 ]] || usage
+LIST=$1
+[[ -f $LIST && -r $LIST ]] || die "cannot read file '$LIST'"
+(( BASH_VERSINFO[0] >= 4 )) || die "bash >= 4 required (on macOS: brew install bash)"
+for cmd in esearch efetch jq; do
+    command -v "$cmd" >/dev/null 2>&1 || die "'$cmd' not found in PATH"
 done
 
+CHUNK=${CHUNK:-200}
+QUERIES=0
+TMP=$(mktemp -d) || die "cannot create temp dir"
+trap 'rm -rf "$TMP"' EXIT
+
+RE_BIOSAMPLE='^SAM(N|EA|D)[0-9]+$'
+RE_ASSEMBLY='^GC[AF]_[0-9]{9}(\.[0-9]+)?$'
+RE_SRA='^[SED]R[RXS][0-9]+$'
+
+# ---------- jq filters ----------
+# Every filter walks all docsum records in the (possibly multi-object) JSON stream.
+
+# assembly: <any accession of the assembly, with and without version> TAB <biosample>
+JQ_ASM_KEYS='(.result.uids // [])[] as $u | .result[$u]
+  | (.biosampleaccn // "") as $bs | select($bs != "")
+  | (.assemblyaccession, .synonym.genbank, .synonym.refseq) | select(. != null and . != "")
+  | ., sub("\\.[0-9]+$"; "")
+  | [., $bs] | @tsv'
+
+# assembly: <biosample> TAB <genbank accession>
+JQ_ASM_GB='(.result.uids // [])[] as $u | .result[$u]
+  | select((.biosampleaccn // "") != "" and (.synonym.genbank // "") != "")
+  | [.biosampleaccn, .synonym.genbank] | @tsv'
+
+# sra: <run/experiment/sample accession> TAB <biosample>
+JQ_SRA_KEYS='(.result.uids // [])[] as $u | .result[$u]
+  | (.expxml // "") as $x
+  | ($x | capture("<Biosample>(?<b>[^<]+)</Biosample>").b) as $bs
+  | ( ((.runs // "") | scan("<Run acc=\"([^\"]+)\"") | .[0]),
+      ($x | scan("<(?:Experiment|Sample) acc=\"([^\"]+)\"") | .[0]) )
+  | [., $bs] | @tsv'
+
+# sra: <biosample> TAB <run accession>
+JQ_SRA_RUNS='(.result.uids // [])[] as $u | .result[$u]
+  | ((.expxml // "") | capture("<Biosample>(?<b>[^<]+)</Biosample>").b) as $bs
+  | (.runs // "") | scan("<Run acc=\"([^\"]+)\"") | [$bs, .[0]] | @tsv'
+
+# biosample: "N" TAB <biosample> TAB <sample name>
+#            "I" TAB <identifier value> TAB <biosample>   (for matching inputs)
+JQ_BS='(.result.uids // [])[] as $u | .result[$u]
+  | .accession as $bs | select(($bs // "") != "")
+  | [(.identifiers // "") | split(";")[] | ltrimstr(" ")
+     | capture("^(?<k>[^:]+): *(?<v>.+)$")] as $ids
+  | (["I", $bs, $bs] | @tsv),
+    ($ids[] | ["I", .v, $bs] | @tsv),
+    ($ids[] | select(.k == "Sample name") | ["N", $bs, .v] | @tsv)'
+
+# ---------- helpers ----------
+
+# fetch <db> <outfile> <terms...> : batched docsum download for all terms
+fetch() {
+    local db=$1 out=$2; shift 2
+    local terms=() q i
+    : > "$out"
+    (( $# )) || return 0
+    mapfile -t terms < <(printf '%s\n' "$@" | tr -d '"' | grep -v '^$' | sort -u)
+    (( ${#terms[@]} )) || return 0
+    log "  $db: ${#terms[@]} term(s), $(( (${#terms[@]} + CHUNK - 1) / CHUNK )) query(ies)"
+    for (( i = 0; i < ${#terms[@]}; i += CHUNK )); do
+        q=$(printf '"%s" OR ' "${terms[@]:i:CHUNK}")
+        q=${q% OR }
+        # </dev/null: EDirect reads stdin when it isn't a terminal
+        esearch -db "$db" -query "$q" </dev/null 2>/dev/null \
+            | efetch -format docsum -mode json 2>/dev/null >> "$out"
+        (( QUERIES++ ))
+    done
+}
+
+# tsv <filter> <file> : run a jq filter, deduplicated TSV output
+tsv() { jq -r "$1" "$2" 2>/dev/null | sort -u; }
+
+# csv <fields...> : one properly quoted CSV row
+csv() {
+    local out=() f
+    for f in "$@"; do
+        [[ $f == *[,\"]* ]] && f="\"${f//\"/\"\"}\""
+        out+=("$f")
+    done
+    (IFS=,; echo "${out[*]}")
+}
+
+# ---------- read input ----------
+INPUTS=()
+while read -r line || [[ -n $line ]]; do
+    line=${line//$'\r'/}                        # strip Windows line endings
+    line=${line%%#*}                            # strip comments
+    line=${line%"${line##*[![:space:]]}"}       # trim trailing whitespace
+    [[ -n $line ]] && INPUTS+=("$line")
+done < "$LIST"
+(( ${#INPUTS[@]} )) || die "no identifiers found in '$LIST'"
+
+asm_q=() sra_q=() bs_q=()
+for id in "${INPUTS[@]}"; do
+    if   [[ $id =~ $RE_ASSEMBLY ]]; then asm_q+=("$id")
+    elif [[ $id =~ $RE_SRA ]];      then sra_q+=("$id")
+    else                                 bs_q+=("$id")    # BioSample accession or name
+    fi
+done
+
+declare -A ACC2BS ID2BS AMBIG NAME RUNS ASM IN2BS
+
+# ---------- step 1: assembly / SRA inputs -> BioSample ----------
+log "Resolving inputs to BioSamples..."
+fetch assembly "$TMP/asm_in.json" "${asm_q[@]}"
+while IFS=$'\t' read -r acc bs; do ACC2BS[$acc]=$bs; done < <(tsv "$JQ_ASM_KEYS" "$TMP/asm_in.json")
+
+fetch sra "$TMP/sra_in.json" "${sra_q[@]}"
+while IFS=$'\t' read -r acc bs; do ACC2BS[$acc]=$bs; done < <(tsv "$JQ_SRA_KEYS" "$TMP/sra_in.json")
+
+# ---------- step 2: BioSample records (names + name/accession matching) ----------
+fetch biosample "$TMP/bs.json" "${bs_q[@]}" "${ACC2BS[@]}"
+while IFS=$'\t' read -r type k v; do
+    case $type in
+        N) NAME[$k]=$v ;;
+        I) key=${k,,}   # case-insensitive, like NCBI search
+           if [[ -n ${ID2BS[$key]} && ${ID2BS[$key]} != "$v" ]]; then
+               AMBIG[$key]+=";$v"
+           else
+               ID2BS[$key]=$v
+           fi ;;
+    esac
+done < <(tsv "$JQ_BS" "$TMP/bs.json")
+
+BS_ALL=()
+for id in "${INPUTS[@]}"; do
+    if [[ $id =~ $RE_ASSEMBLY || $id =~ $RE_SRA ]]; then
+        bs=${ACC2BS[$id]}
+    else
+        key=${id,,}
+        bs=${ID2BS[$key]}
+        [[ -n ${AMBIG[$key]} ]] && \
+            warn "'$id' matches several BioSamples ($bs${AMBIG[$key]}); using $bs"
+    fi
+    IN2BS[$id]=$bs
+    [[ -n $bs ]] && BS_ALL+=("$bs")
+done
+
+# ---------- step 3: BioSample -> SRA runs and assemblies ----------
+log "Fetching linked SRA runs and assemblies..."
+fetch sra "$TMP/sra_bs.json" "${BS_ALL[@]}"
+while IFS=$'\t' read -r bs run; do
+    RUNS[$bs]+="${RUNS[$bs]:+;}$run"
+done < <(tsv "$JQ_SRA_RUNS" "$TMP/sra_bs.json")
+
+fetch assembly "$TMP/asm_bs.json" "${BS_ALL[@]}"
+while IFS=$'\t' read -r bs gb; do
+    ASM[$bs]+="${ASM[$bs]:+;}$gb"
+done < <(tsv "$JQ_ASM_GB" "$TMP/asm_bs.json")
+
+# ---------- output ----------
+echo "INPUT,SAMPLE_NAME,BIOSAMPLE,SRA,GENBANK"
+for id in "${INPUTS[@]}"; do
+    bs=${IN2BS[$id]}
+    if [[ -z $bs ]]; then
+        warn "no BioSample found for '$id'"
+        csv "$id" "" "" "" ""
+    else
+        csv "$id" "${NAME[$bs]}" "$bs" "${RUNS[$bs]}" "${ASM[$bs]}"
+    fi
+done
+
+log "Done: ${#INPUTS[@]} identifier(s) processed with $QUERIES NCBI query round(s)."
